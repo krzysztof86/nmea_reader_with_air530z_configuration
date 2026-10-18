@@ -1,0 +1,150 @@
+NMEA READER — pełny odczyt danych z Air530 / Air530Z
+=================================================
+
+1. CO ROBI PROGRAM
+
+Program pokazuje cały strumień odebrany z portu szeregowego i automatycznie
+zapisuje go w nowym pliku .nmea. Odbiera wszystkie typy komunikatów: GGA,
+RMC, GSA, GSV, GLL, VTG oraz inne, jeżeli odbiornik je wysyła.
+
+Nie odrzuca danych bez ustalonej pozycji ani komunikatów z niepoprawną
+sumą kontrolną. Nie dodaje własnych znaczników czasu do pliku. Zapis
+zachowuje oryginalne bajty, kolejność i zakończenia wierszy CR/LF, również
+niepełny pierwszy lub ostatni komunikat. Pierwszy wiersz może być niepełny,
+ponieważ połączenie można otworzyć w trakcie wysyłania komunikatu.
+
+Program tylko odbiera. Nie wysyła komend do odbiornika i nie zmienia jego
+ustawień. Jeżeli wcześniej ustawiono w module tryb „tylko GGA”, odbierze
+tylko GGA. Inne komunikaty trzeba wtedy ponownie włączyć w odbiorniku,
+używając poleceń właściwych dla Air530 albo Air530Z. To różne wersje układu.
+
+2. WYMAGANIA
+
+- Komputer z Windows 10/11.
+- Standardowy Python 3.10 lub nowszy z komponentem Tcl/Tk (Tkinter).
+  Pobieranie: https://www.python.org/downloads/windows/
+  Nie wybieraj wersji „embeddable”; użyj zwykłej instalacji Pythona.
+- Adapter USB–UART TTL pracujący z sygnałami 3,3 V i przewód Grove.
+- Zasilanie 3,3 V o wydajności co najmniej 100 mA dla płytki Grove.
+  Sprawdź, czy wyjście 3,3 V Twojego adaptera ma taką wydajność.
+  Jeżeli nie, użyj osobnego stabilizowanego zasilania 3,3 V i połącz masy.
+
+Biblioteka pySerial 3.5 jest dołączona w folderze vendor. Nie musisz
+uruchamiać pip ani instalować jej oddzielnie. Nie usuwaj tego folderu.
+Do samego odbioru i zapisu danych nie jest potrzebny Internet.
+
+3. PODŁĄCZENIE — WARIANT TYLKO DO ODCZYTU
+
+Poniższe połączenia dotyczą kompletnej płytki Seeed Grove GPS, a nie
+gołego układu Air530. Ustawienie zasilania i logiki na 3,3 V upraszcza
+dobór poziomów napięć. Nie podłączaj modułu bezpośrednio do USB ani do
+klasycznego portu RS-232 z napięciami dodatnimi i ujemnymi.
+
+Przewód Grove      Funkcja                      Połączenie
+--------------     --------------------------   -------------------------
+Czerwony           VCC płytki                   3,3 V zasilania
+Czarny             GND                          GND adaptera i zasilania
+Żółty              Wyjście danych z GPS         RX / RXD adaptera USB–UART
+Biały              Wejście danych do GPS        Pozostaw niepodłączony
+
+TX adaptera pozostaje niepodłączony. Do tego programu potrzebny jest
+tylko odbiór danych, dlatego wystarczą trzy przewody do płytki Grove.
+Kolory dotyczą standardowego przewodu Grove; sprawdź oznaczenia, jeśli
+korzystasz z innego przewodu. Połącz przewody przed podłączeniem USB.
+
+Płytka Grove dopuszcza również zasilanie 5 V, ale poziom jej sygnałów na
+złączu może zależeć od zasilania i wersji płytki. Podana instrukcja celowo
+używa 3,3 V. Nie zmieniaj zasilania na 5 V bez sprawdzenia adaptera.
+
+4. URUCHOMIENIE W WINDOWS
+
+1) Rozpakuj CAŁY ZIP do zwykłego folderu, np. Dokumenty\NMEA_Reader.
+   Nie uruchamiaj programu bezpośrednio z podglądu archiwum ZIP.
+2) Jeśli nie masz Pythona, zainstaluj go ze wskazanej wyżej oficjalnej strony.
+3) Podłącz adapter do USB. W Menedżerze urządzeń sprawdź numer portu,
+   np. „Porty (COM i LPT)” -> „USB Serial Port (COM3)”.
+   Jeśli port nie pojawia się, zainstaluj sterownik producenta adaptera.
+4) Kliknij dwukrotnie URUCHOM.bat.
+5) W oknie programu kliknij Odśwież i wybierz właściwy port COM.
+6) Pozostaw 9600 bit/s, jeżeli nie zmieniałeś ustawień odbiornika.
+   Program ustawia 8N1 i wyłącza kontrolę przepływu.
+7) Opcjonalnie wybierz „Folder zapisu…”, następnie kliknij „Połącz”.
+8) Pełny strumień pojawi się w ciemnym oknie. Zapis do pliku działa
+   automatycznie przez cały czas połączenia.
+9) Kliknij „Rozłącz”, aby zakończyć pomiar i zamknąć plik.
+
+Domyślny folder: NMEA_zapisy w katalogu Twojego użytkownika Windows.
+Przykład: C:\Users\Szymon\NMEA_zapisy
+Pełna nazwa bieżącego pliku jest widoczna pod podglądem.
+Każde połączenie tworzy osobny plik; istniejące pliki nie są nadpisywane.
+
+„Wyczyść podgląd” nie usuwa danych z pliku. Okno przechowuje ostatnie
+250 000 znaków, aby nie zużywać coraz więcej pamięci. Plik zachowuje
+całość odebranego strumienia. „Kopiuj podgląd” kopiuje tylko zawartość okna.
+
+5. GDY COŚ NIE DZIAŁA
+
+Brak portów COM:
+  Sprawdź kabel USB, sterownik i podłączenie adaptera. Kliknij Odśwież.
+  Możesz również wpisać numer portu ręcznie.
+
+Port zajęty / Access denied:
+  Zamknij monitor portu w Arduino IDE, u-center i inne terminale szeregowe.
+  Jeden port COM powinien być używany przez jeden program naraz.
+
+Połączono, ale licznik bajtów pozostaje na 0:
+  Sprawdź port, zasilanie, wspólną masę oraz połączenie żółtego przewodu
+  Grove do RX adaptera. Brak poprawnej pozycji i całkowity brak danych
+  szeregowych to dwie różne sytuacje.
+
+Nieczytelne znaki:
+  Sprawdź prędkość portu. Dla ustawień fabrycznych zacznij od 9600 bit/s.
+  Jeśli prędkość była zmieniona, ustaw tę samą wartość w programie.
+  Program nie zmienia prędkości w odbiorniku — zmienia tylko ustawienia PC.
+
+Komunikaty przychodzą, ale nie ma współrzędnych / jakość GGA wynosi 0:
+  Umieść antenę na zewnątrz, z możliwie otwartym widokiem nieba, i poczekaj
+  na ustalenie pozycji. Program nadal rejestruje cały strumień.
+
+Widać tylko GGA:
+  Sprawdź konfigurację samego odbiornika. Program nie filtruje typów NMEA.
+
+Odłączono adapter w czasie pracy:
+  Program zgłosi błąd i zamknie plik. Podłącz adapter ponownie, odśwież
+  listę portów i rozpocznij nowe połączenie. Nie łączy się automatycznie,
+  aby nie pomylić innego urządzenia z odbiornikiem.
+
+6. OPCJONALNY TRYB KONSOLI
+
+Otwórz terminal w folderze z programem. Lista portów:
+
+  py -3 nmea_reader.py --list-ports
+
+Odczyt COM3, 9600 bit/s, zapis do nowego pliku pomiar.nmea:
+
+  py -3 nmea_reader.py --console --port COM3 --baud 9600 --output pomiar.nmea
+
+Zakończenie: Ctrl+C. Na standardowe wyjście trafiają wyłącznie odebrane
+bajty; informacje o stanie i błędy trafiają na standardowe wyjście błędów.
+Plik .nmea jest zapisywany niezależnie od zawartości okna terminala.
+
+7. ZAWARTOŚĆ I WERYFIKACJA
+
+nmea_reader.py        — kod programu, okno i tryb konsoli
+URUCHOM.bat          — uruchomienie w Windows
+INSTRUKCJA.txt       — ten dokument
+requirements.txt     — wersja zależności dla instalacji bez folderu vendor
+vendor/serial/       — niezmieniona biblioteka pySerial 3.5
+vendor/pyserial_LICENSE.txt — licencja biblioteki
+
+Sprawdzono odbiór na wirtualnym porcie szeregowym: wszystkie typy zdań,
+podzielone odczyty, niepełne wiersze, niepoprawne bajty, zachowanie CR/LF,
+brak nadpisywania pliku, zatrzymanie bez danych i odłączenie urządzenia.
+Nie wykonano testu z fizycznym Air530 ani testu w systemie Windows.
+
+Materiały producentów:
+https://wiki.seeedstudio.com/Grove-GPS-Air530/
+https://pyserial.readthedocs.io/en/latest/pyserial_api.html
+https://www.python.org/downloads/windows/
+
+Opracowano: 17 października 2026 r.
