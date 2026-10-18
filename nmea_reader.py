@@ -4,7 +4,7 @@
 
 GUI: python nmea_reader.py
 CLI: python nmea_reader.py --console --port COM3 --baud 9600
-The application receives only: it never sends configuration commands.
+The GUI can configure Air530Z using the same serial connection.
 """
 
 from __future__ import annotations
@@ -34,6 +34,73 @@ except ImportError:
     )
 
 
+def calculate_checksum(body: str) -> str:
+    """XOR of the ASCII body, without the $ and * delimiters."""
+    checksum = 0
+    for byte in body.encode("ascii"):
+        checksum ^= byte
+    return f"{checksum:02X}"
+
+
+class Air530ZConfigurator:
+    """Use from the serial owner's worker only; commands have no ACK."""
+
+    def __init__(self, ser: serial.Serial):
+        self.ser = ser
+
+    def _send(self, body: str) -> str:
+        if not self.ser.is_open:
+            raise serial.SerialException("Port nie jest otwarty.")
+        cmd = f"${body}*{calculate_checksum(body)}\r\n"
+        written = self.ser.write(cmd.encode('ascii'))
+        if written != len(cmd):
+            raise serial.SerialException("Niepełny zapis komendy.")
+        self.ser.flush()
+        return cmd.rstrip("\r\n")
+
+    def set_baudrate(self, baud):
+        codes = {9600: 0, 115200: 5}
+        if baud not in codes:
+            raise ValueError("Dozwolone prędkości: 9600, 115200.")
+        cmd = self._send(f"PCAS01,{codes[baud]}")
+        time.sleep(0.2)  # Runs in Capture's worker, never in Tk's thread.
+        self.ser.baudrate = baud
+        return cmd
+
+    def set_system_mode(self, mode):
+        if mode not in range(1, 8):
+            raise ValueError("Tryb systemów musi być z zakresu 1–7.")
+        return self._send(f"PCAS04,{mode}")
+
+    def set_update_rate(self, ms):
+        if ms not in (1000, 500, 200, 100):
+            raise ValueError("Dozwolone interwały: 1000, 500, 200, 100 ms.")
+        return self._send(f"PCAS02,{ms}")
+
+    def set_nmea_sentences(self, bitmask):
+        # Eight flags in GUI order; reserved five fields are always zero.
+        flags = list(bitmask)
+        if len(flags) != 8 or any(flag not in (0, 1) for flag in flags):
+            raise ValueError("Wymagane 8 wartości binarnych GGA…ANT.")
+        return self._send("PCAS03," + ",".join(str(int(f)) for f in flags + [0] * 5))
+
+    def restart(self, mode):
+        if mode not in range(4):
+            raise ValueError("Tryb restartu musi być z zakresu 0–3.")
+        return self._send(f"PCAS10,{mode}")
+
+    def query_firmware(self):
+        return self._send("PCAS06,0")
+
+    def set_satellite_mask(self, system, mask_hex):
+        if system not in (1, 2, 4, 5):
+            raise ValueError("Dozwolone systemy maski: 1, 2, 4, 5.")
+        if (len(mask_hex) != 8 or
+                any(c not in "0123456789abcdefABCDEF" for c in mask_hex)):
+            raise ValueError("Maska musi zawierać dokładnie 8 cyfr hex.")
+        return self._send(f"PCAS15,{system},{mask_hex.upper()}")
+
+
 def default_folder() -> Path:
     return Path.home() / "NMEA_zapisy"
 
@@ -52,6 +119,10 @@ class Capture:
         self.log_path = Path(log_path)
         self.events: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
+        self.commands: queue.Queue = queue.Queue()
+        self.firmware_deadline = None
+        self.firmware_buffer = b""
+        self.firmware_found = False
         self.thread = threading.Thread(target=self._run, daemon=False)
 
     def start(self) -> None:
@@ -59,6 +130,55 @@ class Capture:
 
     def stop(self) -> None:
         self.stop_event.set()
+
+    def configure(self, method: str, *args) -> None:
+        if method not in ("set_baudrate", "set_system_mode", "set_update_rate",
+                          "set_nmea_sentences", "restart", "query_firmware",
+                          "set_satellite_mask"):
+            raise ValueError("Nieznana operacja konfiguracji.")
+        if self.stop_event.is_set():
+            raise ValueError("Połączenie jest zamykane.")
+        self.commands.put((method, args))
+
+    def _configure_pending(self, configurator):
+        try:
+            method, args = self.commands.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            cmd = getattr(configurator, method)(*args)
+            if method == "set_baudrate":
+                self.baud = args[0]
+            if method == "query_firmware":
+                self.firmware_deadline = time.monotonic() + 5
+                self.firmware_buffer = b""
+                self.firmware_found = False
+            self.events.put(("configured", (cmd, self.baud)))
+        except (ValueError, OSError, serial.SerialException) as exc:
+            self.events.put(("configuration_error", str(exc)))
+            # After a failed baud change host/device speeds may disagree.
+            if method == "set_baudrate":
+                raise
+
+    def _observe_firmware(self, data):
+        if self.firmware_deadline is None:
+            return
+        self.firmware_buffer += data
+        while b"\n" in self.firmware_buffer:
+            line, self.firmware_buffer = self.firmware_buffer.split(b"\n", 1)
+            line = line.rstrip(b"\r")
+            # Observe existing input only; never read separately or consume NMEA.
+            if line.startswith(b"$"):
+                header = line.split(b",", 1)[0]
+                if header.endswith(b"TXT") or header in (b"$PCAS06", b"$PCTXT", b"$GPTEXT"):
+                    self.events.put(("firmware", line.decode("ascii", errors="replace")))
+                    self.firmware_found = True
+        self.firmware_buffer = self.firmware_buffer[-4096:]
+        if time.monotonic() >= self.firmware_deadline:
+            if not self.firmware_found:
+                self.events.put(("firmware", "Nie zaobserwowano odpowiedzi FW w ciągu 5 s. Sprawdź też podgląd NMEA."))
+            self.firmware_deadline = None
+            self.firmware_buffer = b""
 
     def _run(self) -> None:
         handle = None
@@ -70,7 +190,7 @@ class Capture:
             handle = serial.Serial(
                 port=None, baudrate=self.baud,
                 bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE, timeout=0.2,
+                stopbits=serial.STOPBITS_ONE, timeout=0.2, write_timeout=1,
                 xonxoff=False, rtscts=False, dsrdtr=False,
             )
             handle.dtr = False
@@ -82,8 +202,11 @@ class Capture:
             log = self.log_path.open("xb")
             created = True
             self.events.put(("opened", str(self.log_path)))
+            configurator = Air530ZConfigurator(handle)
             while not self.stop_event.is_set():
+                self._configure_pending(configurator)
                 data = handle.read(min(max(handle.in_waiting, 1), 4096))
+                self._observe_firmware(data)
                 if not data:
                     continue
                 # Never filter by sentence type, checksum, fix status or encoding.
@@ -188,8 +311,12 @@ def run_gui() -> int:
             if "vista" in style.theme_names():
                 style.theme_use("vista")
             style.configure("TButton", padding=(10, 6))
-            frame = ttk.Frame(root, padding=16)
-            frame.pack(fill="both", expand=True)
+            self.config_ready = False
+            self.config_busy = False
+            self.notebook = ttk.Notebook(root)
+            self.notebook.pack(fill="both", expand=True)
+            frame = ttk.Frame(self.notebook, padding=16)
+            self.notebook.add(frame, text="Odbiór NMEA")
             frame.columnconfigure(0, weight=1)
             frame.rowconfigure(4, weight=1)
             ttk.Label(frame, text="NMEA Reader", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, sticky="w")
@@ -233,8 +360,106 @@ def run_gui() -> int:
             ttk.Label(frame, textvariable=self.stats).grid(row=6, column=0, sticky="w")
             ttk.Label(frame, textvariable=self.log_name, wraplength=980).grid(row=7, column=0, sticky="w", pady=(4, 0))
             ttk.Label(frame, text="Podgląd: ostatnie 250 tys. znaków. Plik zawiera wszystkie odebrane bajty.").grid(row=8, column=0, sticky="w", pady=(5, 0))
+            self.build_configuration()
             self.refresh_ports()
             root.after(80, self.poll)
+
+        def build_configuration(self):
+            page = ttk.Frame(self.notebook, padding=12)
+            self.notebook.add(page, text="Konfiguracja odbiornika")
+            page.columnconfigure(0, weight=1)
+            page.columnconfigure(1, weight=1)
+            self.config_buttons = []
+            self.config_status = tk.StringVar(value="Otwórz port w zakładce Odbiór NMEA.")
+            self.firmware = tk.StringVar(value="Wersja FW: —")
+            self.config_baud = tk.StringVar(value="9600")
+            self.system_mode = tk.StringVar(value="GPS+BDS (3)")
+            self.update_rate = tk.StringVar(value="1 Hz (1000 ms)")
+            self.restart_mode = tk.StringVar(value="Hot Start (0)")
+            self.mask_system = tk.StringVar(value="GPS (1)")
+            self.mask_hex = tk.StringVar(value="00000001")
+            self.nmea_flags = [tk.BooleanVar(value=True) for _ in range(8)]
+
+            def section(title, row, col):
+                box = ttk.LabelFrame(page, text=title, padding=8)
+                box.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
+                return box
+
+            def combo(box, variable, values):
+                widget = ttk.Combobox(box, textvariable=variable, values=values,
+                                      state="readonly", width=25)
+                widget.pack(fill="x", pady=3)
+                return widget
+
+            def button(box, text, action):
+                widget = ttk.Button(box, text=text, command=action, state="disabled")
+                widget.pack(fill="x", pady=3)
+                self.config_buttons.append(widget)
+
+            box = section("Prędkość transmisji", 0, 0)
+            combo(box, self.config_baud, ("9600", "115200"))
+            button(box, "Zmień prędkość", lambda: self.submit_configuration(
+                "set_baudrate", int(self.config_baud.get())))
+            box = section("Systemy satelitarne", 0, 1)
+            systems = ("Tylko GPS (1)", "Tylko BDS (2)", "GPS+BDS (3)",
+                       "GLONASS (4)", "GPS+GLONASS (5)", "BDS+GLONASS (6)", "Wszystkie (7)")
+            combo(box, self.system_mode, systems)
+            button(box, "Zastosuj tryb", lambda: self.submit_configuration(
+                "set_system_mode", systems.index(self.system_mode.get()) + 1))
+            box = section("Częstotliwość aktualizacji", 1, 0)
+            rates = ("1 Hz (1000 ms)", "2 Hz (500 ms)", "5 Hz (200 ms)", "10 Hz (100 ms)")
+            combo(box, self.update_rate, rates)
+            button(box, "Ustaw częstotliwość", lambda: self.submit_configuration(
+                "set_update_rate", (1000, 500, 200, 100)[rates.index(self.update_rate.get())]))
+            box = section("Zdania NMEA", 1, 1)
+            flags = ttk.Frame(box)
+            flags.pack(fill="x")
+            for i, name in enumerate(("GGA", "RMC", "GSA", "GSV", "GLL", "VTG", "ZDA", "ANT")):
+                ttk.Checkbutton(flags, text=name, variable=self.nmea_flags[i]).grid(
+                    row=i // 4, column=i % 4, sticky="w")
+            button(box, "Zapisz wybór zdań", lambda: self.submit_configuration(
+                "set_nmea_sentences", [int(v.get()) for v in self.nmea_flags]))
+            box = section("Restart i diagnostyka", 2, 0)
+            ttk.Label(box, text="Tryb restartu").pack(anchor="w")
+            restarts = ("Hot Start (0)", "Warm Start (1)", "Cold Start (2)", "Factory Start (3)")
+            combo(box, self.restart_mode, restarts)
+            button(box, "Wykonaj restart", lambda: self.submit_configuration(
+                "restart", restarts.index(self.restart_mode.get())))
+            button(box, "Odczytaj wersję FW", lambda: self.submit_configuration("query_firmware"))
+            box = section("Maska satelitów (zaawansowane)", 2, 1)
+            ttk.Label(box, text="System").pack(anchor="w")
+            masks = ("GPS (1)", "BDS (2)", "SBAS (4)", "QZSS (5)")
+            combo(box, self.mask_system, masks)
+            ttk.Label(box, text="Maska (8 hex)").pack(anchor="w")
+            ttk.Entry(box, textvariable=self.mask_hex).pack(fill="x", pady=3)
+            button(box, "Zastosuj maskę", lambda: self.submit_configuration(
+                "set_satellite_mask", (1, 2, 4, 5)[masks.index(self.mask_system.get())],
+                self.mask_hex.get()))
+            ttk.Label(page, textvariable=self.config_status, wraplength=730).grid(
+                row=3, column=0, columnspan=2, sticky="w", pady=8)
+            ttk.Label(page, text="Moduł nie wysyła potwierdzeń komend.").grid(
+                row=4, column=0, columnspan=2, sticky="w")
+            ttk.Label(page, textvariable=self.firmware, wraplength=730).grid(
+                row=5, column=0, columnspan=2, sticky="w", pady=6)
+
+        def update_config_buttons(self):
+            enabled = (self.config_ready and not self.config_busy and self.capture
+                       and not self.capture.stop_event.is_set() and not self.closing)
+            for button in self.config_buttons:
+                button.configure(state="normal" if enabled else "disabled")
+
+        def submit_configuration(self, method, *args):
+            if not self.config_ready or self.config_busy or not self.capture or self.closing:
+                return
+            try:
+                self.capture.configure(method, *args)
+            except ValueError as exc:
+                self.config_status.set(f"Błąd konfiguracji: {exc}")
+                return
+            self.config_busy = True
+            self.update_config_buttons()
+            if method == "query_firmware":
+                self.firmware.set("Wersja FW: nasłuchiwanie strumienia przez 5 s…")
 
         def refresh_ports(self):
             current = self.port.get().split(" | ", 1)[0].strip()
@@ -265,6 +490,7 @@ def run_gui() -> int:
         def toggle(self):
             if self.capture:
                 self.capture.stop()
+                self.update_config_buttons()
                 self.connect_btn.configure(state="disabled")
                 self.status.set("Zamykanie połączenia i pliku…")
                 return
@@ -336,7 +562,25 @@ def run_gui() -> int:
                         kind, value = self.capture.events.get_nowait()
                     except queue.Empty:
                         break
-                    if kind == "opened":
+                    if kind == "configured":
+                        cmd, baud = value
+                        self.baud.set(str(baud))
+                        self.config_baud.set(str(baud))
+                        self.config_status.set(f"Wysłano komendę: {cmd}")
+                        self.config_busy = False
+                        self.update_config_buttons()
+                    elif kind == "configuration_error":
+                        self.config_status.set(f"Błąd konfiguracji: {value}")
+                        self.config_busy = False
+                        self.update_config_buttons()
+                    elif kind == "firmware":
+                        self.firmware.set(value)
+                    elif kind == "opened":
+                        self.config_ready = True
+                        self.config_busy = False
+                        self.config_baud.set(self.baud.get() if self.baud.get() in ("9600", "115200") else "9600")
+                        self.config_status.set("Port otwarty. Możesz wysyłać komendy.")
+                        self.update_config_buttons()
                         self.opened_at = time.monotonic()
                         self.log_name.set(f"Plik: {value}")
                         self.status.set("Połączono. Oczekiwanie na dane z odbiornika…")
@@ -352,6 +596,10 @@ def run_gui() -> int:
                     elif kind == "closed":
                         self.capture.thread.join(timeout=0.1)
                         self.capture = None
+                        self.config_ready = False
+                        self.config_busy = False
+                        self.config_status.set("Port zamknięty. Konfiguracja niedostępna.")
+                        self.update_config_buttons()
                         self.set_connected(False)
                         self.status.set("Zatrzymano z powodu błędu. Sprawdź ostatni plik." if value["failed"] else "Rozłączono. Plik został zamknięty.")
                         break
@@ -371,6 +619,7 @@ def run_gui() -> int:
 
         def close(self):
             self.closing = True
+            self.update_config_buttons()
             if self.capture:
                 self.capture.stop()
                 self.status.set("Zamykanie pliku…")

@@ -13,10 +13,10 @@ zachowuje oryginalne bajty, kolejność i zakończenia wierszy CR/LF, również
 niepełny pierwszy lub ostatni komunikat. Pierwszy wiersz może być niepełny,
 ponieważ połączenie można otworzyć w trakcie wysyłania komunikatu.
 
-Program tylko odbiera. Nie wysyła komend do odbiornika i nie zmienia jego
-ustawień. Jeżeli wcześniej ustawiono w module tryb „tylko GGA”, odbierze
-tylko GGA. Inne komunikaty trzeba wtedy ponownie włączyć w odbiorniku,
-używając poleceń właściwych dla Air530 albo Air530Z. To różne wersje układu.
+Zakładka „Konfiguracja odbiornika” wysyła komendy PCAS dla Air530Z przez
+ten sam otwarty port. Samo połączenie niczego nie konfiguruje. Tryb konsoli
+nadal wyłącznie odbiera i zapisuje dane. Air530 i Air530Z to różne układy;
+panel konfiguracji jest przeznaczony dla Air530Z.
 
 2. WYMAGANIA
 
@@ -45,10 +45,11 @@ Przewód Grove      Funkcja                      Połączenie
 Czerwony           VCC płytki                   3,3 V zasilania
 Czarny             GND                          GND adaptera i zasilania
 Żółty              Wyjście danych z GPS         RX / RXD adaptera USB–UART
-Biały              Wejście danych do GPS        Pozostaw niepodłączony
+Biały              Wejście danych do GPS        TX / TXD adaptera (konfiguracja)
 
-TX adaptera pozostaje niepodłączony. Do tego programu potrzebny jest
-tylko odbiór danych, dlatego wystarczą trzy przewody do płytki Grove.
+Do samego odbioru wystarczą trzy przewody: VCC, GND i wyjście GPS do RX.
+Do konfiguracji potrzebny jest także TX adaptera połączony z wejściem GPS.
+Użyj poziomów logicznych odpowiednich dla swojej płytki Air530Z.
 Kolory dotyczą standardowego przewodu Grove; sprawdź oznaczenia, jeśli
 korzystasz z innego przewodu. Połącz przewody przed podłączeniem USB.
 
@@ -100,7 +101,9 @@ Połączono, ale licznik bajtów pozostaje na 0:
 Nieczytelne znaki:
   Sprawdź prędkość portu. Dla ustawień fabrycznych zacznij od 9600 bit/s.
   Jeśli prędkość była zmieniona, ustaw tę samą wartość w programie.
-  Program nie zmienia prędkości w odbiorniku — zmienia tylko ustawienia PC.
+  Wybór prędkości przed połączeniem ustawia tylko port PC. Przycisk
+  „Zmień prędkość” w konfiguracji wysyła komendę do Air530Z i po 200 ms
+  przełącza również port PC. Adapter musi obsługiwać wybraną prędkość.
 
 Komunikaty przychodzą, ale nie ma współrzędnych / jakość GGA wynosi 0:
   Umieść antenę na zewnątrz, z możliwie otwartym widokiem nieba, i poczekaj
@@ -147,4 +150,49 @@ https://wiki.seeedstudio.com/Grove-GPS-Air530/
 https://pyserial.readthedocs.io/en/latest/pyserial_api.html
 https://www.python.org/downloads/windows/
 
-Opracowano: 17 października 2026 r.
+8. KONFIGURACJA AIR530Z
+
+Najpierw otwórz port w zakładce „Odbiór NMEA”. Przyciski konfiguracji są
+aktywne dopiero po otwarciu portu i pliku. Wszystkie komendy mają sumę XOR
+oraz zakończenie CR+LF. Status „Wysłano komendę: …” oznacza zakończenie
+zapisu do portu, a nie potwierdzenie ustawienia przez moduł: Air530Z nie
+wysyła potwierdzeń. Konfiguracja nie jest wysyłana automatycznie.
+
+- Prędkość: 9600 lub 115200. Komenda PCAS01 jest wysyłana przy aktualnej
+  prędkości, potem po 200 ms przełącza się port PC i pole w panelu odbioru.
+  GUI pozostaje aktywne. Błąd zmiany prędkości zamyka połączenie, ponieważ
+  prędkości PC i odbiornika mogą się wtedy różnić. Połącz ponownie ręcznie.
+- Systemy: wszystkie tryby 1–7, w tym sam GLONASS.
+- Aktualizacja: 1, 2, 5 lub 10 Hz (1000, 500, 200, 100 ms).
+- Zdania: GGA, RMC, GSA, GSV, GLL, VTG, ZDA, ANT. Początkowo wszystkie
+  zaznaczone; nie jest to odczyt aktualnych ustawień modułu. PCAS03 zawiera
+  13 pól: osiem wybranych wartości i pięć zer, zgodnie ze specyfikacją
+  tej aplikacji (w dostarczonej tabeli pojawiało się również 18 pól).
+- Restart: Hot, Warm, Cold lub Factory. Krótka przerwa w NMEA jest normalna.
+  Factory Start może przywrócić ustawienia fabryczne; jeśli dane znikną,
+  rozłącz i połącz ponownie przy fabrycznej prędkości 9600.
+- Wersja FW: PCAS06,0. Przez 5 s aplikacja obserwuje zdania TXT i wybrane
+  odpowiedzi producenta w istniejącym strumieniu, bez dodatkowego odczytu.
+  Brak odpowiedzi nie blokuje odbioru ani innych komend. Odpowiedzi są też
+  widoczne w podglądzie i pozostają w pliku .nmea.
+- Maska: GPS (1), BDS (2), SBAS (4), QZSS (5); dokładnie 8 cyfr hex.
+
+Operacje portu, w tym wysyłanie, zmiana prędkości i odbiór, wykonuje jeden
+wątek roboczy. Przycisk jest chwilowo nieaktywny w trakcie wysyłania.
+Błędna maska nie wysyła żadnych danych i nie zatrzymuje rejestracji.
+
+9. TESTY ZMIAN
+
+  python -m unittest discover -s tests -v
+
+Testy komend sprawdzają sumy kontrolne, CR+LF, walidację, flush i kolejność
+zmiany prędkości. Testy integracyjne na POSIX używają wirtualnego portu,
+sprawdzając odbiór po zmianie prędkości i restarcie bez ACK, pełny zapis
+bajtów oraz konsolę. Test GUI wymaga Tkinter i ekranu (np. Xvfb); sprawdza
+przyciski, komendy, oba pola prędkości, diagnostykę i działanie GUI podczas
+200 ms przerwy. Bez ekranu test GUI jest pomijany. Na Windows testy POSIX
+są pomijane. Do testowania aplikacji na fizycznym Air530Z należy powtórzyć
+zmianę na 115200, Hot Start i sprawdzić odbiór na swoim adapterze USB–UART.
+W środowisku programistycznym nie było podłączonego odbiornika.
+
+Aktualizacja: 18 października 2026 r.
